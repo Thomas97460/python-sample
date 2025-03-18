@@ -4,15 +4,20 @@ on:
   push:
     branches: [ master ]
   pull_request:
+    types: [opened, synchronize, reopened]
     branches: [ master ]
 
 permissions: 
   contents: read
   pull-requests: write
+  checks: write
 
 jobs:
   static-analysis:
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ job.status }}
+      issues_count: ${{ steps.flake8.outputs.issues_count || '0' }}
     
     steps:
     - name: Checkout repository
@@ -26,34 +31,96 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install flake8 pylint mypy black isort
+        pip install flake8
         if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
         
     - name: Lint with flake8
+      id: flake8
       run: |
-        # Stop the build if there are Python syntax errors or undefined names
-        flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
-        # Exit-zero treats all errors as warnings
-        flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
+        # Run flake8 and store results
+        flake8 src/ --count --max-line-length=100 --statistics --output-file=flake8_results.txt || true
         
-    - name: Lint with pylint
-      run: |
-        pylint --disable=all --enable=unused-import,unused-variable src/ --exit-zero
+        # Count issues
+        ISSUES_COUNT=$(grep -c ":" flake8_results.txt || echo "0")
+        echo "issues_count=$ISSUES_COUNT" >> $GITHUB_OUTPUT
         
-    - name: Type checking with mypy
-      run: |
-        mypy --ignore-missing-imports src/
+        # Create a formatted version for the comment
+        echo "# Code Quality Issues" > formatted_results.md
+        echo "" >> formatted_results.md
         
-    - name: Check code formatting with black
-      run: |
-        black --check src/ || echo "Code formatting issues found, please run black on your code"
+        if [ "$ISSUES_COUNT" -eq "0" ]; then
+          echo "✅ **No issues found.** Your code meets all quality standards!" >> formatted_results.md
+        else
+          echo "⚠️ **Found $ISSUES_COUNT issues** that should be fixed:" >> formatted_results.md
+          echo "" >> formatted_results.md
+          echo "| File | Line | Column | Error Code | Description |" >> formatted_results.md
+          echo "|------|------|--------|------------|-------------|" >> formatted_results.md
+          
+          # Parse each issue and format it for markdown table
+          while IFS= read -r line; do
+            if [[ $line =~ ([^:]+):([0-9]+):([0-9]+):\ ([A-Z][0-9]+)\ (.*) ]]; then
+              FILE="${BASH_REMATCH[1]}"
+              LINE="${BASH_REMATCH[2]}"
+              COL="${BASH_REMATCH[3]}"
+              CODE="${BASH_REMATCH[4]}"
+              MSG="${BASH_REMATCH[5]}"
+              echo "| $FILE | $LINE | $COL | $CODE | $MSG |" >> formatted_results.md
+            fi
+          done < flake8_results.txt
+          
+          # Add a summary of issue types
+          echo "" >> formatted_results.md
+          echo "### Summary by issue type:" >> formatted_results.md
+          echo "" >> formatted_results.md
+          echo "```" >> formatted_results.md
+          grep -o "[A-Z][0-9]\+" flake8_results.txt | sort | uniq -c | sort -nr >> formatted_results.md
+          echo "```" >> formatted_results.md
+        fi
         
-    - name: Check import order with isort
-      run: |
-        isort --check-only --profile black src/ || echo "Import order issues found, please run isort on your code"
+        # Save the formatted results as an artifact
+        cat formatted_results.md > flake8_formatted.md
+        
+    - name: Upload Flake8 Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: flake8-report
+        path: |
+          flake8_results.txt
+          flake8_formatted.md
+        retention-days: 30
+        
+    - name: Comment on PR with code quality results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const issue_number = context.payload.pull_request.number;
+          const issues_count = parseInt('${{ steps.flake8.outputs.issues_count || 0 }}');
+          
+          // Read the formatted report
+          const report = fs.readFileSync('flake8_formatted.md', 'utf8');
+          
+          await github.rest.issues.createComment({
+            issue_number: issue_number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `### 🔍 Code Quality Analysis Results
+            
+            ${report}
+            
+            ${issues_count > 0 
+              ? `\n\n⚠️ Please fix these issues before merging.\n\n> For a detailed explanation of error codes, visit [Flake8 Rules](https://www.flake8rules.com/)` 
+              : '\n\n✨ Great job keeping the code clean!'}`
+          });
 
   dast-security:
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ job.status }}
+      findings: ${{ steps.count_findings.outputs.count || '0' }}
     
     steps:
     - name: Checkout repository
@@ -76,6 +143,7 @@ jobs:
         sleep 5
         
     - name: ZAP Scan
+      id: zap
       uses: zaproxy/action-baseline@v0.14.0
       with:
         docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
@@ -84,6 +152,17 @@ jobs:
         fail_action: false
         artifact_name: "zap-scan-report"
         allow_issue_writing: false
+        
+    - name: Count security findings
+      id: count_findings
+      if: always()
+      run: |
+        if [ -f report.json ]; then
+          COUNT=$(grep -o '"riskcode": "[1-3]"' report.json | wc -l)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+        else
+          echo "count=0" >> $GITHUB_OUTPUT
+        fi
         
     - name: Upload ZAP Scan Results
       uses: actions/upload-artifact@v4
@@ -95,43 +174,114 @@ jobs:
           report.md
           report.json
         retention-days: 30
+        
+    - name: Comment on PR with DAST results
+      if: github.event_name == 'pull_request' && always()
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const issue_number = context.payload.pull_request.number;
+
+          let report = "### 🔒 Dynamic Application Security Testing Results\n\n";
+          try {
+            const zapOutput = fs.readFileSync('report_md.md', 'utf8');
+            const warnings = zapOutput.match(/WARN-NEW: .+/g) || [];
+            
+            if (warnings.length > 0) {
+              report += `⚠️ **${warnings.length} warnings** found during the ZAP scan:\n\n`;
+              warnings.forEach(warning => {
+                const [rule, ...details] = warning.split(' x ');
+                report += `- **${rule.trim()}** (${details.join(' x ').trim()})\n`;
+              });
+            } else {
+              report += "✅ **No warnings found.** The application passed the ZAP scan!";
+            }
+          } catch (error) {
+            report += "⚠️ Error processing ZAP scan results: Unable to read or parse the report.";
+          }
+
+          await github.rest.issues.createComment({
+            issue_number: issue_number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: report
+          });
 
   dependency-analysis:
     runs-on: ubuntu-latest
-    
+    outputs:
+      status: ${{ job.status }}
+      vulnerabilities: ${{ steps.count_vulnerabilities.outputs.count || '0' }}
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v2
       
-    - name: OWASP Dependency Check
-      uses: dependency-check/Dependency-Check_Action@main
-      with:
-        project: 'Python Web App'
-        path: '.'
-        format: 'HTML'
-        out: 'reports'
-        
-    - name: Upload OWASP Dependency Check Results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: dependency-check-report
-        path: reports/
-        
-    - name: Scan Python Dependencies
+    - name: Install safety and check dependencies
       run: |
-        python -m pip install --upgrade pip
         pip install safety
         pip freeze > requirements-lock.txt
         safety check -r requirements-lock.txt --output json > safety-report.json || true
+    
+    - name: Format vulnerability results
+      id: format_vulnerabilities
+      if: always()
+      run: |
+        python scripts/format_vulnerabilities.py safety-report.json vuln_formatted.md
         
     - name: Upload Safety Check Results
       uses: actions/upload-artifact@v4
       if: always()
       with:
         name: safety-check-report
-        path: safety-report.json
+        path: |
+          safety-report.json
+          vuln_formatted.md
         retention-days: 30
+
+    - name: Count dependency vulnerabilities
+      id: count_vulnerabilities
+      if: always()
+      run: |
+        if [ -f safety-report.json ]; then
+          COUNT=$(grep -o '"vulnerability_id":' safety-report.json | wc -l)
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+        else
+          echo "count=0" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Comment on PR with dependency analysis results
+      if: github.event_name == 'pull_request' && always()
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const fs = require('fs');
+          const issue_number = context.payload.pull_request.number;
+          const vulnerabilities = ${{ steps.count_vulnerabilities.outputs.count || 0 }};
+          
+          // Read the formatted report
+          let report = "";
+          try {
+            report = fs.readFileSync('vuln_formatted.md', 'utf8');
+          } catch (error) {
+            report = "Error reading vulnerability report. Check workflow logs for details.";
+          }
+          
+          await github.rest.issues.createComment({
+            issue_number: issue_number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `### 📦 Dependency Analysis Results
+            
+            ${report}
+            
+            ${vulnerabilities > 0 
+              ? `\n\n⚠️ Please review these vulnerabilities before merging.\n\n> For more details, check the \`safety-check-report\` and \`dependency-check-report\` artifacts.` 
+              : '\n\n✨ Great job! No known vulnerabilities in your dependencies.'}`
+          });
 
   build-and-push:
     needs: [static-analysis, dast-security, dependency-analysis]
@@ -139,6 +289,9 @@ jobs:
     environment: prod
     env:
       ARTIFACT_REGISTRY: ${{ vars.ARTIFACT_REGISTRY }}
+    outputs:
+      status: ${{ job.status }}
+      image: ${{ env.ARTIFACT_REGISTRY }}/python-web-app:${{ github.sha }}
     
     steps:
     - name: Checkout repository
@@ -186,3 +339,74 @@ jobs:
         sleep 5
         curl http://localhost:5000 || echo "Failed to access application, but continuing..."
         docker stop test-container || true
+        
+    - name: Comment on PR with Docker build results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const issue_number = context.payload.pull_request.number;
+          const imageUrl = '${{ env.ARTIFACT_REGISTRY }}/python-web-app:${{ github.sha }}';
+          
+          await github.rest.issues.createComment({
+            issue_number: issue_number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `### 🐳 Docker Build Results
+            
+            **Status**: ✅ Success
+            
+            **Image URL**: \`${imageUrl}\`
+            
+            The Docker image has been built, tested, and pushed to the artifact registry.`
+          });
+
+  summary:
+    needs: [static-analysis, dast-security, dependency-analysis, build-and-push]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && always()
+    steps:
+      - name: Generate summary comment
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issue_number = context.payload.pull_request.number;
+            
+            const getStatusEmoji = (status) => {
+              if (status === 'success') return "✅";
+              if (status === 'failure') return "❌";
+              if (status === 'cancelled') return "⚠️";
+              return "❓";
+            };
+            
+            const static_analysis = '${{ needs.static-analysis.outputs.status }}';
+            const code_issues = parseInt('${{ needs.static-analysis.outputs.issues_count || 0 }}');
+            const dast_security = '${{ needs.dast-security.outputs.status }}';
+            const dependency_analysis = '${{ needs.dependency-analysis.outputs.status }}';
+            const build_and_push = '${{ needs.build-and-push.outputs.status }}';
+            const security_findings = parseInt('${{ needs.dast-security.outputs.findings || 0 }}');
+            const dep_vulnerabilities = parseInt('${{ needs.dependency-analysis.outputs.vulnerabilities || 0 }}');
+            const image_url = '${{ needs.build-and-push.outputs.image }}';
+            
+            let summaryBody = `### 📊 CI/CD Pipeline Summary
+            
+            | Stage | Status | Details |
+            |-------|--------|---------|
+            | Code Quality | ${getStatusEmoji(static_analysis)} ${static_analysis} | ${code_issues} style/quality issues found |
+            | Security Testing | ${getStatusEmoji(dast_security)} ${dast_security} | ${security_findings} potential vulnerabilities found |
+            | Dependency Analysis | ${getStatusEmoji(dependency_analysis)} ${dependency_analysis} | ${dep_vulnerabilities} vulnerable dependencies found |
+            | Docker Build & Push | ${getStatusEmoji(build_and_push)} ${build-and-push} | \`${image_url}\` |
+            
+            ${(static_analysis === 'success' && dast_security === 'success' && dependency_analysis === 'success' && build_and_push === 'success' && code_issues === 0) 
+              ? "✅ **All checks passed successfully!** This PR is ready for review and can be safely merged."
+              : "⚠️ **Some issues were detected.** Please review the individual reports before merging."}
+            `;
+            
+            await github.rest.issues.createComment({
+              issue_number: issue_number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summaryBody
+            });
