@@ -1,12 +1,26 @@
 import json
 import re
 import sys
+import os
 
 def main(input_file, output_file):
     try:
+        # Vérifier si le fichier existe et n'est pas vide
+        if not os.path.exists(input_file) or os.path.getsize(input_file) == 0:
+            with open(output_file, "w") as out:
+                out.write("✅ **No vulnerabilities found.** Your dependencies are secure!\n")
+            return
+
+        # Charger le contenu JSON
         with open(input_file, "r") as f:
-            data = json.load(f)
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError as e:
+                with open(output_file, "w") as out:
+                    out.write(f"Error processing vulnerabilities: Invalid JSON format. Details: {str(e)}\n")
+                return
         
+        # Créer le fichier de sortie
         with open(output_file, "w") as out:
             out.write("# Dependency Vulnerabilities\n\n")
             
@@ -29,7 +43,7 @@ def main(input_file, output_file):
                     vuln_id = v.get("vulnerability_id", "Unknown")
                     description = v.get("advisory", "No description available")
                     
-                    # Clean up description for markdown table
+                    # Nettoyer la description pour le tableau Markdown
                     description = re.sub(r"\s+", " ", description).strip()
                     description = description[:100] + "..." if len(description) > 100 else description
                     
