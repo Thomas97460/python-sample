@@ -181,22 +181,32 @@ jobs:
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
+          const fs = require('fs');
           const issue_number = context.payload.pull_request.number;
-          const findings = ${{ steps.count_findings.outputs.count || 0 }};
-          
-          const status = findings > 0 ? '⚠️ Found ' + findings + ' potential vulnerabilities' : '✅ No vulnerabilities detected';
-          
+
+          let report = "### 🔒 Dynamic Application Security Testing Results\n\n";
+          try {
+            const zapOutput = fs.readFileSync('report_md.md', 'utf8');
+            const warnings = zapOutput.match(/WARN-NEW: .+/g) || [];
+            
+            if (warnings.length > 0) {
+              report += `⚠️ **${warnings.length} warnings** found during the ZAP scan:\n\n`;
+              warnings.forEach(warning => {
+                const [rule, ...details] = warning.split(' x ');
+                report += `- **${rule.trim()}** (${details.join(' x ').trim()})\n`;
+              });
+            } else {
+              report += "✅ **No warnings found.** The application passed the ZAP scan!";
+            }
+          } catch (error) {
+            report += "⚠️ Error processing ZAP scan results: Unable to read or parse the report.";
+          }
+
           await github.rest.issues.createComment({
             issue_number: issue_number,
             owner: context.repo.owner,
             repo: context.repo.repo,
-            body: `### 🔒 Dynamic Application Security Testing Results
-            
-            **Status**: ${status}
-            
-            For detailed results, please check the \`zap-scan-results\` artifact in this workflow run.
-            
-            > This scan analyzes the running application for security vulnerabilities.`
+            body: report
           });
 
   dependency-analysis:
@@ -204,29 +214,13 @@ jobs:
     outputs:
       status: ${{ job.status }}
       vulnerabilities: ${{ steps.count_vulnerabilities.outputs.count || '0' }}
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v2
       
-    - name: OWASP Dependency Check
-      uses: dependency-check/Dependency-Check_Action@main
-      with:
-        project: 'Python Web App'
-        path: '.'
-        format: 'HTML'
-        out: 'reports'
-        
-    - name: Upload OWASP Dependency Check Results
-      uses: actions/upload-artifact@v4
-      if: always()
-      with:
-        name: dependency-check-report
-        path: reports/
-        
-    - name: Scan Python Dependencies
+    - name: Install safety and check dependencies
       run: |
-        python -m pip install --upgrade pip
         pip install safety
         pip freeze > requirements-lock.txt
         safety check -r requirements-lock.txt --output json > safety-report.json || true
@@ -246,7 +240,7 @@ jobs:
           safety-report.json
           vuln_formatted.md
         retention-days: 30
-        
+
     - name: Count dependency vulnerabilities
       id: count_vulnerabilities
       if: always()
@@ -403,7 +397,7 @@ jobs:
             | Code Quality | ${getStatusEmoji(static_analysis)} ${static_analysis} | ${code_issues} style/quality issues found |
             | Security Testing | ${getStatusEmoji(dast_security)} ${dast_security} | ${security_findings} potential vulnerabilities found |
             | Dependency Analysis | ${getStatusEmoji(dependency_analysis)} ${dependency_analysis} | ${dep_vulnerabilities} vulnerable dependencies found |
-            | Docker Build & Push | ${getStatusEmoji(build_and_push)} ${build_and_push} | \`${image_url}\` |
+            | Docker Build & Push | ${getStatusEmoji(build_and_push)} ${build-and-push} | \`${image_url}\` |
             
             ${(static_analysis === 'success' && dast_security === 'success' && dependency_analysis === 'success' && build_and_push === 'success' && code_issues === 0) 
               ? "✅ **All checks passed successfully!** This PR is ready for review and can be safely merged."
