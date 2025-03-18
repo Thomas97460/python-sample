@@ -7,7 +7,49 @@ on:
     branches: [ master ]
 
 jobs:
+  static-analysis:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+      
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pylint mypy black isort
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        
+    - name: Lint with flake8
+      run: |
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings
+        flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
+        
+    - name: Lint with pylint
+      run: |
+        pylint --disable=all --enable=unused-import,unused-variable src/ --exit-zero
+        
+    - name: Type checking with mypy
+      run: |
+        mypy --ignore-missing-imports src/
+        
+    - name: Check code formatting with black
+      run: |
+        black --check src/ || echo "Code formatting issues found, please run black on your code"
+        
+    - name: Check import order with isort
+      run: |
+        isort --check-only --profile black src/ || echo "Import order issues found, please run isort on your code"
+
   build:
+    needs: static-analysis
     runs-on: ubuntu-latest
 
     steps:
